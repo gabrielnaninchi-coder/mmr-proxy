@@ -1,27 +1,53 @@
+// Generación de imágenes para MMR · Gestión (con cuentas y límite de uso)
+// Esconde la clave de OpenAI y exige que el usuario haya iniciado sesión.
+import { sql, ensureTables, getUsuarioFromRequest, setCors } from "./_lib/db.js";
+
+// Límite de seguridad anti-abuso: máximo de imágenes por hora y por usuario.
+const LIMITE_POR_HORA = 10;
+
 export default async function handler(req, res) {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-App-Token");
-  if (req.method === "OPTIONS") {
-    return res.status(200).end();
-  }
-  if (req.method !== "POST") {
-    return res.status(405).json({ error: "Metodo no permitido" });
-  }
+  setCors(res);
+  if (req.method === "OPTIONS") return res.status(200).end();
+  if (req.method !== "POST") return res.status(405).json({ error: "Método no permitido" });
+
+  // Capa 1: el token compartido de la app (evita uso desde fuera de la app).
   const appToken = req.headers["x-app-token"];
   if (!process.env.APP_TOKEN || appToken !== process.env.APP_TOKEN) {
     return res.status(401).json({ error: "No autorizado" });
   }
+
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) {
     return res.status(500).json({ error: "Servidor sin clave configurada" });
   }
+
   try {
+    await ensureTables();
+
+    // Capa 2: el usuario debe haber iniciado sesión (token de sesión válido).
+    const usuario = await getUsuarioFromRequest(req);
+    if (!usuario) {
+      return res.status(401).json({ error: "Debes iniciar sesión para generar imágenes." });
+    }
+
+    // Límite anti-abuso: contar las imágenes de la última hora de ESTE usuario.
+    const cuenta = await sql`
+      SELECT count(*)::int AS n FROM uso
+      WHERE usuario_id = ${usuario.id} AND momento > now() - interval '1 hour'
+    `;
+    const usadasUltimaHora = cuenta[0]?.n || 0;
+    if (usadasUltimaHora >= LIMITE_POR_HORA) {
+      return res.status(429).json({
+        error: "Has alcanzado el límite de " + LIMITE_POR_HORA + " imágenes por hora. Inténtalo más tarde.",
+      });
+    }
+
     const { prompt, photo, quality } = req.body || {};
     if (!prompt) {
-      return res.status(400).json({ error: "Falta el texto de la simulacion" });
+      return res.status(400).json({ error: "Falta el texto de la simulación" });
     }
     const q = quality || "medium";
+
     let openaiRes;
     if (photo) {
       const blob = dataURLtoBlob(photo);
@@ -53,6 +79,7 @@ export default async function handler(req, res) {
         }),
       });
     }
+
     if (!openaiRes.ok) {
       let msg = "Error " + openaiRes.status;
       try {
@@ -61,15 +88,24 @@ export default async function handler(req, res) {
       } catch (e) {}
       return res.status(openaiRes.status).json({ error: msg });
     }
+
     const data = await openaiRes.json();
     const b64 = data.data && data.data[0] && data.data[0].b64_json;
-    if (b64) {
-      return res.status(200).json({ image: "data:image/png;base64," + b64 });
+    let imagen = null;
+    if (b64) imagen = "data:image/png;base64," + b64;
+    else if (data.data && data.data[0] && data.data[0].url) imagen = data.data[0].url;
+
+    if (!imagen) {
+      return res.status(500).json({ error: "Respuesta inesperada de OpenAI" });
     }
-    if (data.data && data.data[0] && data.data[0].url) {
-      return res.status(200).json({ image: data.data[0].url });
-    }
-    return res.status(500).json({ error: "Respuesta inesperada de OpenAI" });
+
+    // Registrar el uso (solo si la imagen salió bien, para no penalizar errores)
+    await sql`INSERT INTO uso (usuario_id, tipo) VALUES (${usuario.id}, ${photo ? "simulacion" : "generacion"})`;
+
+    return res.status(200).json({
+      image: imagen,
+      restantesHora: Math.max(0, LIMITE_POR_HORA - usadasUltimaHora - 1),
+    });
   } catch (e) {
     return res.status(500).json({ error: "Error del servidor: " + (e.message || "desconocido") });
   }
